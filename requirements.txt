@@ -1,0 +1,6 @@
+python-telegram-bot==13.7
+PyPDF2
+ebooklib
+Pillow
+Flask
+reportlab
