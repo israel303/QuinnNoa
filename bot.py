@@ -1,7 +1,7 @@
 import os
 import sys
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, request
 from PyPDF2 import PdfReader, PdfWriter
 from PIL import Image
@@ -10,10 +10,11 @@ from reportlab.pdfgen import canvas
 from ebooklib import epub
 import io
 import uuid
+import asyncio
 
 # בדיקת גרסת Python
 if sys.version_info >= (3, 13):
-    print("Running on Python 3.13 or higher, ensuring no imghdr dependency")
+    print("Running on Python 3.13 or higher, using python-telegram-bot>=20.8")
 
 # הגדרת Flask
 app = Flask(__name__)
@@ -25,35 +26,35 @@ WEBHOOK_URL = "YOUR_RENDER_URL"  # החלף בכתובת ה-Web Service שלך �
 # מיקום התמונה הקבועה בריפוזיטורי
 COVER_IMAGE_PATH = "cover.jpg"  # התמונה תהיה בתיקיית הפרויקט
 
-def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text(
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
         "היי! אני בוט שמוסיף עמוד ראשון עם תמונה לקבצי PDF או EPUB. "
         "פשוט שלח לי קובץ, ואני אטפל בו! 😊"
     )
 
-def handle_document(update: Update, context: CallbackContext) -> None:
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     document = update.message.document
     if document.mime_type not in ["application/pdf", "application/epub+zip"]:
-        update.message.reply_text("אנא שלח קובץ PDF או EPUB בלבד. 😊")
+        await update.message.reply_text("אנא שלח קובץ PDF או EPUB בלבד. 😊")
         return
 
-    file = context.bot.get_file(document.file_id)
+    file = await document.get_file()
     file_extension = ".pdf" if document.mime_type == "application/pdf" else ".epub"
     file_name = f"temp_{uuid.uuid4()}{file_extension}"
     
     # הורדת הקובץ
     try:
-        file.download(file_name)
+        await file.download_to_drive(file_name)
     except Exception as e:
-        update.message.reply_text("מצטער, הייתה בעיה בהורדת הקובץ. נסה שוב! 😔")
+        await update.message.reply_text("מצטער, הייתה בעיה בה\ורדת הקובץ. נסה שוב! 😔")
         return
     
     # עיבוד הקובץ
-    update.message.reply_text("מעבד את הקובץ, רגע בבקשה... 😊")
+    await update.message.reply_text("מעבד את הקובץ, רגע בבקשה... 😊")
     try:
         output_file = process_file(file_name, file_extension)
     except Exception as e:
-        update.message.reply_text(f"אופס, משהו השתבש בעיבוד הקובץ: {str(e)}. בדוק שהקובץ תקין ונסה שוב! 😅")
+        await update.message.reply_text(f"אופס, משהו השתבש בעיבוד הקובץ: {str(e)}. בדוק שהקובץ תקין ונסה שוב! 😅")
         if os.path.exists(file_name):
             os.remove(file_name)
         return
@@ -61,10 +62,10 @@ def handle_document(update: Update, context: CallbackContext) -> None:
     # שליחת הקובץ המשודרג
     try:
         with open(output_file, "rb") as f:
-            update.message.reply_document(f, filename=f"modified_{document.file_name}")
-            update.message.reply_text("הקובץ מוכן! הנה הוא עם העמוד הראשון החדש. 🎉")
+            await update.message.reply_document(f, filename=f"modified_{document.file_name}")
+            await update.message.reply_text("הקובץ מוכן! הנה הוא עם העמוד הראשון החדש. 🎉")
     except Exception as e:
-        update.message.reply_text("מצטער, לא הצלחתי לשלוח את הקובץ. נסה שוב מאוחר יותר! 😔")
+        await update.message.reply_text("מצטער, לא הצלחתי לשלוח את הקובץ. נסה שוב מאוחר יותר! 😔")
     
     # ניקוי קבצים זמניים
     if os.path.exists(file_name):
@@ -75,7 +76,7 @@ def handle_document(update: Update, context: CallbackContext) -> None:
 def process_file(input_file: str, extension: str) -> str:
     output_file = f"output_{uuid.uuid4()}{extension}"
     
-    # בדיקת תקינות התמונה הקבועה עם Pillow בלבד
+    # בדיקת תקינות התמונה הקבועה עם Pillow
     try:
         with Image.open(COVER_IMAGE_PATH) as img:
             img.verify()  # בדיקת תקינות התמונה
@@ -149,37 +150,36 @@ def process_file(input_file: str, extension: str) -> str:
     
     return output_file
 
-# טיפול בהודעות טקסט שאינן קבצים
-def handle_text(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text(
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
         "אני מקבל רק קבצי PDF או EPUB. שלח לי קובץ, ואוסיף לו עמוד ראשון! 😊 "
         "אם אתה צריך עזרה, כתוב /start."
     )
 
-# הגדרת Webhook עבור Render
+# הגדרת Webhook עבור Flask
 @app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
     return "OK"
 
 # נקודת כניסה ראשית
 if __name__ == "__main__":
-    updater = Updater(TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
-    bot = updater.bot  # הגדרת הבוט לשימוש ב-webhook
+    # הגדרת Application עבור python-telegram-bot v20
+    application = Application.builder().token(TOKEN).build()
     
     # הוספת handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.document, handle_document))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     # הגדרת Webhook
-    try:
-        updater.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-    except Exception as e:
-        print(f"Error setting webhook: {e}")
+    async def set_webhook():
+        await application.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
     
-    # הרצת Flask
+    # הרצת Flask עם Webhook
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(set_webhook())
+    
     port = int(os.environ.get("PORT", 8443))
     app.run(host="0.0.0.0", port=port)
