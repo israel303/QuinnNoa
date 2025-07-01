@@ -1,4 +1,5 @@
 import os
+import sys
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from flask import Flask, request
@@ -9,6 +10,10 @@ from reportlab.pdfgen import canvas
 from ebooklib import epub
 import io
 import uuid
+
+# בדיקת גרסת Python
+if sys.version_info >= (3, 13):
+    print("Running on Python 3.13 or higher, ensuring no imghdr dependency")
 
 # הגדרת Flask
 app = Flask(__name__)
@@ -49,7 +54,8 @@ def handle_document(update: Update, context: CallbackContext) -> None:
         output_file = process_file(file_name, file_extension)
     except Exception as e:
         update.message.reply_text(f"אופס, משהו השתבש בעיבוד הקובץ: {str(e)}. בדוק שהקובץ תקין ונסה שוב! 😅")
-        os.remove(file_name)
+        if os.path.exists(file_name):
+            os.remove(file_name)
         return
     
     # שליחת הקובץ המשודרג
@@ -61,16 +67,19 @@ def handle_document(update: Update, context: CallbackContext) -> None:
         update.message.reply_text("מצטער, לא הצלחתי לשלוח את הקובץ. נסה שוב מאוחר יותר! 😔")
     
     # ניקוי קבצים זמניים
-    os.remove(file_name)
-    os.remove(output_file)
+    if os.path.exists(file_name):
+        os.remove(file_name)
+    if os.path.exists(output_file):
+        os.remove(output_file)
 
 def process_file(input_file: str, extension: str) -> str:
     output_file = f"output_{uuid.uuid4()}{extension}"
     
-    # בדיקת תקינות התמונה הקבועה
+    # בדיקת תקינות התמונה הקבועה עם Pillow בלבד
     try:
         with Image.open(COVER_IMAGE_PATH) as img:
             img.verify()  # בדיקת תקינות התמונה
+            img = Image.open(COVER_IMAGE_PATH)  # פתיחה מחדש כי verify() סוגר את הקובץ
             img_format = img.format.lower() if img.format else None
             if img_format not in ['jpeg', 'png']:
                 raise ValueError("התמונה הקבועה חייבת להיות בפורמט JPEG או PNG")
@@ -85,7 +94,6 @@ def process_file(input_file: str, extension: str) -> str:
         cover_pdf = "cover.pdf"
         try:
             c = canvas.Canvas(cover_pdf, pagesize=letter)
-            # התאמת התמונה לגודל העמוד
             c.drawImage(COVER_IMAGE_PATH, 0, 0, width=letter[0], height=letter[1], preserveAspectRatio=True)
             c.showPage()
             c.save()
@@ -93,8 +101,13 @@ def process_file(input_file: str, extension: str) -> str:
             raise Exception(f"שגיאה ביצירת עמוד התמונה: {str(e)}")
         
         # הוספת עמוד התמונה
-        cover_reader = PdfReader(cover_pdf)
-        pdf_writer.add_page(cover_reader.pages[0])
+        try:
+            cover_reader = PdfReader(cover_pdf)
+            pdf_writer.add_page(cover_reader.pages[0])
+        except Exception as e:
+            if os.path.exists(cover_pdf):
+                os.remove(cover_pdf)
+            raise Exception(f"שגיאה בקריאת עמוד התמונה: {str(e)}")
         
         # הוספת שאר עמודי הקובץ המקורי
         try:
@@ -102,14 +115,16 @@ def process_file(input_file: str, extension: str) -> str:
             for page in original_reader.pages:
                 pdf_writer.add_page(page)
         except Exception as e:
-            os.remove(cover_pdf)
+            if os.path.exists(cover_pdf):
+                os.remove(cover_pdf)
             raise Exception(f"שגיאה בקריאת קובץ PDF: {str(e)}")
         
         # שמירת הקובץ החדש
         with open(output_file, "wb") as f:
             pdf_writer.write(f)
         
-        os.remove(cover_pdf)
+        if os.path.exists(cover_pdf):
+            os.remove(cover_pdf)
     
     elif extension == ".epub":
         # טיפול ב-EPUB
@@ -160,7 +175,10 @@ if __name__ == "__main__":
     dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
     
     # הגדרת Webhook
-    updater.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+    try:
+        updater.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+    except Exception as e:
+        print(f"Error setting webhook: {e}")
     
     # הרצת Flask
     port = int(os.environ.get("PORT", 8443))
