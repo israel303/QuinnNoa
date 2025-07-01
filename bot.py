@@ -1,16 +1,16 @@
 import os
 import sys
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import InvalidToken
 from flask import Flask, request
 from PyPDF2 import PdfReader, PdfWriter
 from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from ebooklib import epub
-import io
 import uuid
-import asyncio
 
 # בדיקת גרסת Python
 if sys.version_info >= (3, 13):
@@ -19,9 +19,14 @@ if sys.version_info >= (3, 13):
 # הגדרת Flask
 app = Flask(__name__)
 
-# הגדרות טלגרם
-TOKEN = "YOUR_BOT_TOKEN"  # החלף בטוקן של הבוט שלך
-WEBHOOK_URL = "YOUR_RENDER_URL"  # החלף בכתובת ה-Web Service שלך ב-Render
+# קריאת משתני סביבה
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise ValueError("שגיאה: משתנה הסביבה TOKEN לא הוגדר. ודא שהגדרת אותו ב-Render.")
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+if not WEBHOOK_URL:
+    raise ValueError("שגיאה: משתנה הסביבה WEBHOOK_URL לא הוגדר. ודא שהגדרת אותו ב-Render.")
 
 # מיקום התמונה הקבועה בריפוזיטורי
 COVER_IMAGE_PATH = "cover.jpg"  # התמונה תהיה בתיקיית הפרויקט
@@ -46,7 +51,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         await file.download_to_drive(file_name)
     except Exception as e:
-        await update.message.reply_text("מצטער, הייתה בעיה בה\ורדת הקובץ. נסה שוב! 😔")
+        await update.message.reply_text("מצטער, הייתה בעיה בהורדת הקובץ. נסה שוב! 😔")
         return
     
     # עיבוד הקובץ
@@ -159,9 +164,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # הגדרת Webhook עבור Flask
 @app.route(f"/{TOKEN}", methods=["POST"])
 async def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    await application.process_update(update)
-    return "OK"
+    try:
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        await application.process_update(update)
+        return "OK"
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return "Error", 500
 
 # נקודת כניסה ראשית
 if __name__ == "__main__":
@@ -173,13 +182,24 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    # הגדרת Webhook
-    async def set_webhook():
-        await application.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+    # בדיקת תקינות הטוקן והגדרת Webhook
+    async def verify_and_set_webhook():
+        try:
+            bot_info = await application.bot.get_me()
+            print(f"Bot connected successfully: {bot_info.username}")
+            await application.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
+            print(f"Webhook set to {WEBHOOK_URL}/{TOKEN}")
+        except InvalidToken:
+            print("שגיאה: הטוקן אינו תקין. ודא שהזנת את הטוקן נכון ב-Render.")
+            raise ValueError("שגיאה: הטוקן אינו תקין. בדוק את משתנה הסביבה TOKEN ב-Render.")
+        except Exception as e:
+            print(f"שגיאה בהגדרת Webhook: {e}")
+            raise ValueError(f"שגיאה בהגדרת Webhook: {str(e)}")
     
     # הרצת Flask עם Webhook
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(set_webhook())
+    loop = asyncio.new_event_loop()  # תיקון לאזהרת DeprecationWarning
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(verify_and_set_webhook())
     
     port = int(os.environ.get("PORT", 8443))
     app.run(host="0.0.0.0", port=port)
