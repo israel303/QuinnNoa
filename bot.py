@@ -12,6 +12,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from ebooklib import epub
 import uuid
+import threading
 
 # הגדרת לוגים
 logging.basicConfig(
@@ -26,6 +27,9 @@ if sys.version_info >= (3, 13):
 
 # הגדרת Flask
 app = Flask(__name__)
+
+# משתנה גלובלי עבור Application
+application = None
 
 # קריאת משתני סביבה
 TOKEN = os.getenv("TOKEN")
@@ -102,9 +106,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.info(f"Temporary file removed: {file_name}")
     if os.path.exists(output_file):
         os.remove(output_file)
-        logger.info(f"Output file removed: { استرات
-
-{output_file}")
+        logger.info(f"Output file removed: {output_file}")
 
 def process_file(input_file: str, extension: str) -> str:
     output_file = f"output_{uuid.uuid4()}{extension}"
@@ -114,7 +116,8 @@ def process_file(input_file: str, extension: str) -> str:
     try:
         with Image.open(COVER_IMAGE_PATH) as img:
             img.verify()  # בדיקת תקינות התמונה
-            img = Image.open(COVER_IMAGE_PATH)  # פתיחה מחדש כי verify() סוגר את הקובץ
+        # פתיחה מחדש כי verify() סוגר את הקובץ
+        with Image.open(COVER_IMAGE_PATH) as img:
             img_format = img.format.lower() if img.format else None
             if img_format not in ['jpeg', 'png']:
                 raise ValueError("התמונה הקבועה חייבת להיות בפורמט JPEG או PNG")
@@ -128,7 +131,7 @@ def process_file(input_file: str, extension: str) -> str:
         pdf_writer = PdfWriter()
         
         # יצירת עמוד PDF עם התמונה באמצעות reportlab
-        cover_pdf = "cover.pdf"
+        cover_pdf = f"cover_{uuid.uuid4()}.pdf"
         try:
             c = canvas.Canvas(cover_pdf, pagesize=letter)
             c.drawImage(COVER_IMAGE_PATH, 0, 0, width=letter[0], height=letter[1], preserveAspectRatio=True)
@@ -179,19 +182,50 @@ def process_file(input_file: str, extension: str) -> str:
         # טיפול ב-EPUB
         try:
             book = epub.read_epub(input_file)
-            cover_item = epub.EpubItem(
+            
+            # הוספת התמונה לקובץ EPUB
+            with open(COVER_IMAGE_PATH, 'rb') as img_file:
+                img_data = img_file.read()
+            
+            # קביעת סוג MIME בהתאם לסוג התמונה
+            img_extension = os.path.splitext(COVER_IMAGE_PATH)[1].lower()
+            if img_extension == '.jpg' or img_extension == '.jpeg':
+                media_type = 'image/jpeg'
+            elif img_extension == '.png':
+                media_type = 'image/png'
+            else:
+                media_type = 'image/jpeg'  # ברירת מחדל
+            
+            # הוספת התמונה לקובץ EPUB
+            img_item = epub.EpubItem(
+                uid="cover_image",
+                file_name="cover_image" + img_extension,
+                media_type=media_type,
+                content=img_data
+            )
+            book.add_item(img_item)
+            
+            # יצירת עמוד HTML עבור התמונה
+            cover_item = epub.EpubHtml(
                 uid="cover",
                 file_name="cover.xhtml",
-                media_type="application/xhtml+xml",
-                content=f"""
-                <html xmlns="http://www.w3.org/1999/xhtml">
-                <head><title>Cover</title></head>
-                <body><img src="{COVER_IMAGE_PATH}" style="width:100%;height:auto;"/></body>
-                </html>
-                """.encode()
+                title="Cover"
             )
+            cover_item.content = f"""<?xml version="1.0" encoding="utf-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml">
+            <head><title>Cover</title></head>
+            <body style="text-align: center; margin: 0; padding: 0;">
+                <img src="cover_image{img_extension}" style="width:100%; height:auto; max-width:100%; max-height:100%;"/>
+            </body>
+            </html>"""
+            
             book.add_item(cover_item)
             book.spine.insert(0, cover_item)  # הוספת העמוד הראשון
+            
+            # עדכון TOC אם קיים
+            if hasattr(book, 'toc') and book.toc:
+                book.toc.insert(0, cover_item)
+            
             epub.write_epub(output_file, book)
             logger.info(f"Output EPUB saved: {output_file}")
         except Exception as e:
@@ -209,13 +243,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # הגדרת Webhook עבור Flask
 @app.route(f"/{TOKEN}", methods=["POST"])
-async def webhook():
+def webhook():
     try:
         data = request.get_json(force=True)
-        logger.info(f"Received webhook update: {data}")
+        logger.info(f"Received webhook update")
         update = Update.de_json(data, application.bot)
         if update:
-            await application.process_update(update)
+            # הרצת העדכון באופן אסינכרוני
+            asyncio.create_task(application.process_update(update))
             logger.info("Webhook update processed successfully")
             return "OK"
         else:
@@ -224,6 +259,11 @@ async def webhook():
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
         return "Error", 500
+
+# פונקציה להרצת Flask בחוט נפרד
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 # נקודת כניסה ראשית
 if __name__ == "__main__":
@@ -240,7 +280,7 @@ if __name__ == "__main__":
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     # בדיקת תקינות הטוקן והגדרת Webhook
-    async def verify_and_set_webhook():
+    async def setup_application():
         try:
             await application.initialize()  # איתחול ה-Application
             logger.info("Application initialized")
@@ -255,15 +295,26 @@ if __name__ == "__main__":
             logger.error(f"Error setting webhook: {str(e)}")
             raise ValueError(f"שגיאה בהגדרת Webhook: {str(e)}")
     
-    # הרצת Flask עם Webhook
+    # הרצת הגדרות ראשוניות
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(verify_and_set_webhook())
+        loop.run_until_complete(setup_application())
+        logger.info("Application setup completed successfully")
     except Exception as e:
-        logger.error(f"Failed to start application: {str(e)}")
+        logger.error(f"Failed to setup application: {str(e)}")
         loop.close()
         raise
     
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # הרצת Flask בחוט נפרד
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started")
+    
+    # השארת הלולאה פעילה
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        logger.info("Application stopped by user")
+    finally:
+        loop.close()
