@@ -175,7 +175,11 @@ async def webhook():
 # נקודת כניסה ראשית
 if __name__ == "__main__":
     # הגדרת Application עבור python-telegram-bot v20
-    application = Application.builder().token(TOKEN).build()
+    try:
+        application = Application.builder().token(TOKEN).build()
+    except InvalidToken:
+        print("שגיאה: הטוקן אינו תקין. ודא שהזנת את הטוקן נכון ב-Render.")
+        raise ValueError("שגיאה: הטוקן אינו תקין. בדוק את משתנה הסביבה TOKEN ב-Render.")
     
     # הוספת handlers
     application.add_handler(CommandHandler("start", start))
@@ -197,7 +201,7 @@ if __name__ == "__main__":
             raise ValueError(f"שגיאה בהגדרת Webhook: {str(e)}")
     
     # הרצת Flask עם Webhook
-    loop = asyncio.new_event_loop()  # תיקון לאזהרת DeprecationWarning
+    loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(verify_and_set_webhook())
     
