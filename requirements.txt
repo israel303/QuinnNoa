@@ -1,6 +1,6 @@
 python-telegram-bot>=20.8
-PyPDF2>=3.0.1
-ebooklib>=0.18
+PyPDF2>=3.0.0
+reportlab>=4.0.0
 Pillow>=10.0.0
-flask[async]>=2.0.0
-reportlab>=4.0.4
+ebooklib>=0.18
+Flask>=2.3.0
