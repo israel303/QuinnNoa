@@ -1,17 +1,17 @@
 import os
-import sys
+import io
 import asyncio
 import logging
-from telegram import Update
+from typing import Optional
+from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import InvalidToken
-from flask import Flask, request
+from telegram.error import TelegramError, BadRequest
 from PyPDF2 import PdfReader, PdfWriter
-from PIL import Image
-from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from PIL import Image
 from ebooklib import epub
-import uuid
+from flask import Flask, request, jsonify
 import threading
 
 # הגדרת לוגים
@@ -21,300 +21,366 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# בדיקת גרסת Python
-if sys.version_info >= (3, 13):
-    logger.info("Running on Python 3.13 or higher, using python-telegram-bot>=20.8")
-
-# הגדרת Flask
-app = Flask(__name__)
-
-# משתנה גלובלי עבור Application
-application = None
-
-# קריאת משתני סביבה
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    logger.error("Environment variable TOKEN not set")
-    raise ValueError("שגיאה: משתנה הסביבה TOKEN לא הוגדר. ודא שהגדרת אותו ב-Render.")
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-if not WEBHOOK_URL:
-    logger.error("Environment variable WEBHOOK_URL not set")
-    raise ValueError("שגיאה: משתנה הסביבה WEBHOOK_URL לא הוגדר. ודא שהגדרת אותו ב-Render.")
-
-# מיקום התמונה הקבועה בריפוזיטורי
-COVER_IMAGE_PATH = "cover.jpg"  # התמונה תהיה בתיקיית הפרויקט
-
-# בדיקת קיום התמונה בתחילת הריצה
-if not os.path.exists(COVER_IMAGE_PATH):
-    logger.error(f"Cover image not found at {COVER_IMAGE_PATH}")
-    raise FileNotFoundError(f"שגיאה: התמונה {COVER_IMAGE_PATH} לא נמצאה בתיקיית הפרויקט.")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Received /start command")
-    await update.message.reply_text(
-        "היי! אני בוט שמוסיף עמוד ראשון עם תמונה לקבצי PDF או EPUB. "
-        "פשוט שלח לי קובץ, ואני אטפל בו! 😊"
-    )
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info(f"Received document: {update.message.document.file_name}")
-    document = update.message.document
-    if document.mime_type not in ["application/pdf", "application/epub+zip"]:
-        logger.warning(f"Invalid file type: {document.mime_type}")
-        await update.message.reply_text("אנא שלח קובץ PDF או EPUB בלבד. 😊")
-        return
-
-    file = await document.get_file()
-    file_extension = ".pdf" if document.mime_type == "application/pdf" else ".epub"
-    file_name = f"temp_{uuid.uuid4()}{file_extension}"
+class EfficientCoverBot:
+    """בוט יעיל להוספת כיסוי לקבצי PDF ו-EPUB"""
     
-    # הורדת הקובץ
-    try:
-        await file.download_to_drive(file_name)
-        logger.info(f"File downloaded: {file_name}")
-    except Exception as e:
-        logger.error(f"Error downloading file: {str(e)}")
-        await update.message.reply_text("מצטער, הייתה בעיה בהורדת הקובץ. נסה שוב! 😔")
-        return
+    # הגדרת קבועים
+    MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+    SUPPORTED_FORMATS = ["application/pdf", "application/epub+zip"]
+    COVER_IMAGE_PATH = "cover.jpg"
     
-    # עיבוד הקובץ
-    await update.message.reply_text("מעבד את הקובץ, רגע בבקשה... 😊")
-    try:
-        output_file = process_file(file_name, file_extension)
-        logger.info(f"File processed: {output_file}")
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}")
-        await update.message.reply_text(f"אופס, משהו השתבש בעיבוד הקובץ: {str(e)}. בדוק שהקובץ תקין ונסה שוב! 😅")
-        if os.path.exists(file_name):
-            os.remove(file_name)
-        return
+    def __init__(self, token: str, webhook_url: str):
+        self.token = token
+        self.webhook_url = webhook_url
+        self.app = Application.builder().token(token).build()
+        self._validate_cover_image()
+        self._setup_handlers()
     
-    # שליחת הקובץ המשודרג
-    try:
-        with open(output_file, "rb") as f:
-            await update.message.reply_document(f, filename=f"modified_{document.file_name}")
-            await update.message.reply_text("הקובץ מוכן! הנה הוא עם העמוד הראשון החדש. 🎉")
-        logger.info(f"File sent: {output_file}")
-    except Exception as e:
-        logger.error(f"Error sending file: {str(e)}")
-        await update.message.reply_text("מצטער, לא הצלחתי לשלוח את הקובץ. נסה שוב מאוחר יותר! 😔")
-    
-    # ניקוי קבצים זמניים
-    if os.path.exists(file_name):
-        os.remove(file_name)
-        logger.info(f"Temporary file removed: {file_name}")
-    if os.path.exists(output_file):
-        os.remove(output_file)
-        logger.info(f"Output file removed: {output_file}")
-
-def process_file(input_file: str, extension: str) -> str:
-    output_file = f"output_{uuid.uuid4()}{extension}"
-    logger.info(f"Processing file: {input_file} to {output_file}")
-    
-    # בדיקת תקינות התמונה הקבועה עם Pillow
-    try:
-        with Image.open(COVER_IMAGE_PATH) as img:
-            img.verify()  # בדיקת תקינות התמונה
-        # פתיחה מחדש כי verify() סוגר את הקובץ
-        with Image.open(COVER_IMAGE_PATH) as img:
-            img_format = img.format.lower() if img.format else None
-            if img_format not in ['jpeg', 'png']:
-                raise ValueError("התמונה הקבועה חייבת להיות בפורמט JPEG או PNG")
-        logger.info(f"Cover image verified: {COVER_IMAGE_PATH}")
-    except Exception as e:
-        logger.error(f"Error with cover image: {str(e)}")
-        raise Exception(f"שגיאה בתמונה הקבועה: {str(e)}")
-    
-    if extension == ".pdf":
-        # טיפול ב-PDF
-        pdf_writer = PdfWriter()
+    def _validate_cover_image(self) -> None:
+        """בדיקת תקינות תמונת הכיסוי"""
+        if not os.path.exists(self.COVER_IMAGE_PATH):
+            raise FileNotFoundError(f"תמונת הכיסוי לא נמצאה: {self.COVER_IMAGE_PATH}")
         
-        # יצירת עמוד PDF עם התמונה באמצעות reportlab
-        cover_pdf = f"cover_{uuid.uuid4()}.pdf"
         try:
-            c = canvas.Canvas(cover_pdf, pagesize=letter)
-            c.drawImage(COVER_IMAGE_PATH, 0, 0, width=letter[0], height=letter[1], preserveAspectRatio=True)
-            c.showPage()
-            c.save()
-            logger.info(f"Cover PDF created: {cover_pdf}")
+            with Image.open(self.COVER_IMAGE_PATH) as img:
+                img.verify()
+            logger.info(f"תמונת כיסוי תקינה: {self.COVER_IMAGE_PATH}")
         except Exception as e:
-            logger.error(f"Error creating cover PDF: {str(e)}")
-            raise Exception(f"שגיאה ביצירת עמוד התמונה: {str(e)}")
-        
-        # הוספת עמוד התמונה
-        try:
-            cover_reader = PdfReader(cover_pdf)
-            pdf_writer.add_page(cover_reader.pages[0])
-            logger.info("Cover page added to PDF")
-        except Exception as e:
-            if os.path.exists(cover_pdf):
-                os.remove(cover_pdf)
-            logger.error(f"Error reading cover PDF: {str(e)}")
-            raise Exception(f"שגיאה בקריאת עמוד התמונה: {str(e)}")
-        
-        # הוספת שאר עמודי הקובץ המקורי
-        try:
-            original_reader = PdfReader(input_file)
-            for page in original_reader.pages:
-                pdf_writer.add_page(page)
-            logger.info("Original PDF pages added")
-        except Exception as e:
-            if os.path.exists(cover_pdf):
-                os.remove(cover_pdf)
-            logger.error(f"Error reading original PDF: {str(e)}")
-            raise Exception(f"שגיאה בקריאת קובץ PDF: {str(e)}")
-        
-        # שמירת הקובץ החדש
-        try:
-            with open(output_file, "wb") as f:
-                pdf_writer.write(f)
-            logger.info(f"Output PDF saved: {output_file}")
-        except Exception as e:
-            logger.error(f"Error saving output PDF: {str(e)}")
-            raise Exception(f"שגיאה בשמירת קובץ PDF: {str(e)}")
-        
-        if os.path.exists(cover_pdf):
-            os.remove(cover_pdf)
-            logger.info(f"Temporary cover PDF removed: {cover_pdf}")
+            raise ValueError(f"תמונת הכיסוי אינה תקינה: {e}")
     
-    elif extension == ".epub":
-        # טיפול ב-EPUB
+    def _setup_handlers(self) -> None:
+        """הגדרת handlers לבוט"""
+        self.app.add_handler(CommandHandler("start", self.start_handler))
+        self.app.add_handler(CommandHandler("help", self.help_handler))
+        self.app.add_handler(MessageHandler(filters.Document.ALL, self.document_handler))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_handler))
+        
+        # Error handler
+        self.app.add_error_handler(self.error_handler)
+    
+    async def start_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """פקודת /start"""
+        welcome_message = (
+            "🎨 **בוט הוספת כיסוי לקבצים**\n\n"
+            "אני מוסיף עמוד כיסוי עם תמונה לקבצי PDF ו-EPUB!\n\n"
+            "**איך להשתמש:**\n"
+            "• שלח לי קובץ PDF או EPUB\n"
+            "• אקבל את הקובץ עם כיסוי חדש\n"
+            "• גודל מקסימלי: 20MB\n\n"
+            "לעזרה נוספת: /help"
+        )
+        await update.message.reply_text(welcome_message, parse_mode='Markdown')
+        logger.info(f"משתמש {update.effective_user.id} התחיל את הבוט")
+    
+    async def help_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """פקודת /help"""
+        help_message = (
+            "📚 **עזרה לשימוש בבוט**\n\n"
+            "**פורמטים נתמכים:**\n"
+            "• PDF (.pdf)\n"
+            "• EPUB (.epub)\n\n"
+            "**הגבלות:**\n"
+            "• גודל מקסימלי: 20MB\n"
+            "• קבצים תקינים בלבד\n\n"
+            "**שאלות נפוצות:**\n"
+            "• הבוט מוסיף את הכיסוי כעמוד ראשון\n"
+            "• התמונה מותאמת לגודל העמוד\n"
+            "• הקובץ המקורי נשמר כפי שהיה\n\n"
+            "צריך עזרה? פנה למפתח הבוט!"
+        )
+        await update.message.reply_text(help_message, parse_mode='Markdown')
+    
+    async def document_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """טיפול בקבצים שנשלחו"""
+        document: Document = update.message.document
+        user_id = update.effective_user.id
+        
+        logger.info(f"קובץ התקבל מהמשתמש {user_id}: {document.file_name}")
+        
+        # בדיקת תקינות הקובץ
+        validation_error = self._validate_document(document)
+        if validation_error:
+            await update.message.reply_text(validation_error)
+            return
+        
+        # הודעת התחלת עיבוד
+        processing_msg = await update.message.reply_text("🔄 מעבד את הקובץ...")
+        
         try:
-            book = epub.read_epub(input_file)
+            # הורדת הקובץ לזיכרון
+            file = await document.get_file()
+            file_bytes = io.BytesIO()
+            await file.download_to_memory(file_bytes)
+            file_bytes.seek(0)
             
-            # הוספת התמונה לקובץ EPUB
-            with open(COVER_IMAGE_PATH, 'rb') as img_file:
+            # עיבוד הקובץ
+            if document.mime_type == "application/pdf":
+                result_bytes = await asyncio.to_thread(self._process_pdf, file_bytes)
+            else:  # EPUB
+                result_bytes = await asyncio.to_thread(self._process_epub, file_bytes)
+            
+            # שליחת הקובץ המעובד
+            result_io = io.BytesIO(result_bytes)
+            result_io.name = f"cover_{document.file_name}"
+            
+            await update.message.reply_document(
+                document=result_io,
+                filename=f"cover_{document.file_name}",
+                caption="✅ הקובץ מוכן עם כיסוי חדש!"
+            )
+            
+            # מחיקת הודעת העיבוד
+            await processing_msg.delete()
+            
+            logger.info(f"קובץ נשלח בהצלחה למשתמש {user_id}")
+            
+        except Exception as e:
+            logger.error(f"שגיאה בעיבוד קובץ למשתמש {user_id}: {e}")
+            await processing_msg.edit_text(
+                f"❌ אופס! קרתה שגיאה בעיבוד הקובץ:\n`{str(e)[:100]}...`\n\nנסה שוב עם קובץ אחר.",
+                parse_mode='Markdown'
+            )
+    
+    async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """טיפול בהודעות טקסט"""
+        await update.message.reply_text(
+            "📄 אני מעבד רק קבצי PDF ו-EPUB!\n\n"
+            "שלח לי קובץ ואני אוסיף לו כיסוי יפה 🎨\n"
+            "לעזרה: /help"
+        )
+    
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """טיפול בשגיאות"""
+        logger.error(f"שגיאה בבוט: {context.error}")
+        
+        if isinstance(update, Update) and update.message:
+            try:
+                await update.message.reply_text(
+                    "❌ אופס! קרתה שגיאה לא צפויה.\nנסה שוב או פנה למפתח הבוט."
+                )
+            except:
+                pass
+    
+    def _validate_document(self, document: Document) -> Optional[str]:
+        """בדיקת תקינות הקובץ"""
+        if document.file_size > self.MAX_FILE_SIZE:
+            return f"❌ הקובץ גדול מדי! מקסימום {self.MAX_FILE_SIZE // (1024*1024)}MB"
+        
+        if document.mime_type not in self.SUPPORTED_FORMATS:
+            return "❌ פורמט לא נתמך! שלח קובץ PDF או EPUB בלבד"
+        
+        if not document.file_name:
+            return "❌ הקובץ חייב להיות עם שם תקין"
+        
+        return None
+    
+    def _process_pdf(self, file_bytes: io.BytesIO) -> bytes:
+        """עיבוד קובץ PDF"""
+        logger.info("מתחיל עיבוד PDF")
+        
+        try:
+            cover_pdf_bytes = self._create_pdf_cover()
+            original_reader = PdfReader(file_bytes)
+            cover_reader = PdfReader(io.BytesIO(cover_pdf_bytes))
+            
+            writer = PdfWriter()
+            writer.add_page(cover_reader.pages[0])
+            
+            for page in original_reader.pages:
+                writer.add_page(page)
+            
+            output = io.BytesIO()
+            writer.write(output)
+            
+            logger.info("עיבוד PDF הושלם בהצלחה")
+            return output.getvalue()
+            
+        except Exception as e:
+            logger.error(f"שגיאה בעיבוד PDF: {e}")
+            raise Exception(f"שגיאה בעיבוד קובץ PDF: {str(e)}")
+    
+    def _process_epub(self, file_bytes: io.BytesIO) -> bytes:
+        """עיבוד קובץ EPUB"""
+        logger.info("מתחיל עיבוד EPUB")
+        
+        try:
+            book = epub.read_epub(file_bytes)
+            
+            with open(self.COVER_IMAGE_PATH, 'rb') as img_file:
                 img_data = img_file.read()
             
-            # קביעת סוג MIME בהתאם לסוג התמונה
-            img_extension = os.path.splitext(COVER_IMAGE_PATH)[1].lower()
-            if img_extension == '.jpg' or img_extension == '.jpeg':
-                media_type = 'image/jpeg'
-            elif img_extension == '.png':
-                media_type = 'image/png'
-            else:
-                media_type = 'image/jpeg'  # ברירת מחדל
+            img_extension = os.path.splitext(self.COVER_IMAGE_PATH)[1].lower()
+            media_type = 'image/jpeg' if img_extension in ['.jpg', '.jpeg'] else 'image/png'
             
-            # הוספת התמונה לקובץ EPUB
             img_item = epub.EpubItem(
                 uid="cover_image",
-                file_name="cover_image" + img_extension,
+                file_name=f"cover{img_extension}",
                 media_type=media_type,
                 content=img_data
             )
             book.add_item(img_item)
             
-            # יצירת עמוד HTML עבור התמונה
+            cover_html = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <title>Cover</title>
+    <style>
+        body {{ margin: 0; padding: 0; text-align: center; }}
+        img {{ max-width: 100%; max-height: 100vh; }}
+    </style>
+</head>
+<body>
+    <img src="cover{img_extension}" alt="Cover"/>
+</body>
+</html>"""
+            
             cover_item = epub.EpubHtml(
-                uid="cover",
+                uid="cover_page",
                 file_name="cover.xhtml",
                 title="Cover"
             )
-            cover_item.content = f"""<?xml version="1.0" encoding="utf-8"?>
-            <html xmlns="http://www.w3.org/1999/xhtml">
-            <head><title>Cover</title></head>
-            <body style="text-align: center; margin: 0; padding: 0;">
-                <img src="cover_image{img_extension}" style="width:100%; height:auto; max-width:100%; max-height:100%;"/>
-            </body>
-            </html>"""
+            cover_item.content = cover_html
             
             book.add_item(cover_item)
-            book.spine.insert(0, cover_item)  # הוספת העמוד הראשון
+            book.spine.insert(0, cover_item)
             
-            # עדכון TOC אם קיים
-            if hasattr(book, 'toc') and book.toc:
-                book.toc.insert(0, cover_item)
+            output = io.BytesIO()
+            epub.write_epub(output, book)
             
-            epub.write_epub(output_file, book)
-            logger.info(f"Output EPUB saved: {output_file}")
+            logger.info("עיבוד EPUB הושלם בהצלחה")
+            return output.getvalue()
+            
         except Exception as e:
-            logger.error(f"Error processing EPUB: {str(e)}")
+            logger.error(f"שגיאה בעיבוד EPUB: {e}")
             raise Exception(f"שגיאה בעיבוד קובץ EPUB: {str(e)}")
     
-    return output_file
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Received text message")
-    await update.message.reply_text(
-        "אני מקבל רק קבצי PDF או EPUB. שלח לי קובץ, ואוסיף לו עמוד ראשון! 😊 "
-        "אם אתה צריך עזרה, כתוב /start."
-    )
-
-# הגדרת Webhook עבור Flask
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    try:
-        data = request.get_json(force=True)
-        logger.info(f"Received webhook update")
-        update = Update.de_json(data, application.bot)
-        if update:
-            # הרצת העדכון באופן אסינכרוני
-            asyncio.create_task(application.process_update(update))
-            logger.info("Webhook update processed successfully")
-            return "OK"
-        else:
-            logger.warning("Webhook received invalid update")
-            return "Invalid update", 400
-    except Exception as e:
-        logger.error(f"Webhook error: {str(e)}")
-        return "Error", 500
-
-# פונקציה להרצת Flask בחוט נפרד
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
-
-# נקודת כניסה ראשית
-if __name__ == "__main__":
-    # הגדרת Application עבור python-telegram-bot v20
-    try:
-        application = Application.builder().token(TOKEN).build()
-    except InvalidToken:
-        logger.error("Invalid token provided")
-        raise ValueError("שגיאה: הטוקן אינו תקין. בדוק את משתנה הסביבה TOKEN ב-Render.")
+    def _create_pdf_cover(self) -> bytes:
+        """יצירת עמוד כיסוי PDF"""
+        cover_bytes = io.BytesIO()
+        c = canvas.Canvas(cover_bytes, pagesize=letter)
+        
+        c.drawImage(
+            self.COVER_IMAGE_PATH, 
+            0, 0, 
+            width=letter[0], 
+            height=letter[1],
+            preserveAspectRatio=True,
+            anchor='c'
+        )
+        
+        c.showPage()
+        c.save()
+        
+        return cover_bytes.getvalue()
     
-    # הוספת handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    # בדיקת תקינות הטוקן והגדרת Webhook
-    async def setup_application():
+    async def setup_webhook(self):
+        """הגדרת webhook"""
+        await self.app.initialize()
+        webhook_url = f"{self.webhook_url}/webhook/{self.token}"
+        
         try:
-            await application.initialize()  # איתחול ה-Application
-            logger.info("Application initialized")
-            bot_info = await application.bot.get_me()
-            logger.info(f"Bot connected successfully: {bot_info.username}")
-            await application.bot.set_webhook(f"{WEBHOOK_URL}/{TOKEN}")
-            logger.info(f"Webhook set to {WEBHOOK_URL}/{TOKEN}")
-        except InvalidToken:
-            logger.error("Invalid token during webhook setup")
-            raise ValueError("שגיאה: הטוקן אינו תקין. בדוק את משתנה הסביבה TOKEN ב-Render.")
+            await self.app.bot.set_webhook(webhook_url)
+            logger.info(f"Webhook נקבע בהצלחה: {webhook_url}")
+            
+            # בדיקת מידע על הבוט
+            bot_info = await self.app.bot.get_me()
+            logger.info(f"בוט מחובר: @{bot_info.username}")
+            
         except Exception as e:
-            logger.error(f"Error setting webhook: {str(e)}")
-            raise ValueError(f"שגיאה בהגדרת Webhook: {str(e)}")
+            logger.error(f"שגיאה בהגדרת webhook: {e}")
+            raise
     
-    # הרצת הגדרות ראשוניות
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    async def process_webhook_update(self, update_data: dict):
+        """עיבוד עדכון מ-webhook"""
+        try:
+            update = Update.de_json(update_data, self.app.bot)
+            if update:
+                await self.app.process_update(update)
+        except Exception as e:
+            logger.error(f"שגיאה בעיבוד webhook update: {e}")
+
+# יצירת Flask app לwebhook
+flask_app = Flask(__name__)
+bot_instance = None
+
+@flask_app.route('/', methods=['GET'])
+def health_check():
+    """בדיקת תקינות השירות"""
+    return jsonify({
+        "status": "running",
+        "service": "Telegram Cover Bot",
+        "version": "1.0"
+    })
+
+@flask_app.route(f'/webhook/<token>', methods=['POST'])
+def webhook_handler(token):
+    """מטפל ב-webhook updates"""
+    global bot_instance
+    
+    if not bot_instance or bot_instance.token != token:
+        return jsonify({"error": "Invalid token"}), 401
+    
     try:
-        loop.run_until_complete(setup_application())
-        logger.info("Application setup completed successfully")
+        update_data = request.get_json(force=True)
+        if not update_data:
+            return jsonify({"error": "No data received"}), 400
+        
+        # יצירת task לעיבוד אסינכרוני
+        asyncio.create_task(bot_instance.process_webhook_update(update_data))
+        
+        return jsonify({"status": "ok"})
+        
     except Exception as e:
-        logger.error(f"Failed to setup application: {str(e)}")
-        loop.close()
-        raise
+        logger.error(f"שגיאה ב-webhook handler: {e}")
+        return jsonify({"error": str(e)}), 500
+
+def run_flask():
+    """הרצת Flask server"""
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
+
+async def main():
+    """פונקציה ראשית"""
+    global bot_instance
+    
+    # קריאת משתני סביבה
+    token = os.getenv("BOT_TOKEN")
+    webhook_url = os.getenv("WEBHOOK_URL")
+    
+    if not token:
+        raise ValueError("❌ משתנה הסביבה BOT_TOKEN לא הוגדר!")
+    
+    if not webhook_url:
+        raise ValueError("❌ משתנה הסביבה WEBHOOK_URL לא הוגדר!")
+    
+    # יצירת הבוט
+    bot_instance = EfficientCoverBot(token, webhook_url)
+    
+    # הגדרת webhook
+    await bot_instance.setup_webhook()
     
     # הרצת Flask בחוט נפרד
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info("Flask server started")
     
-    # השארת הלולאה פעילה
+    logger.info("🚀 הבוט רץ במצב webhook!")
+    logger.info(f"🌐 URL: {webhook_url}/webhook/{token}")
+    
+    # השארת הבוט פעיל
     try:
-        loop.run_forever()
+        while True:
+            await asyncio.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Application stopped by user")
+        logger.info("עוצר את הבוט...")
     finally:
-        loop.close()
+        await bot_instance.app.shutdown()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("הבוט נעצר על ידי המשתמש")
+    except Exception as e:
+        logger.error(f"שגיאה קריטית: {e}")
+        raise
