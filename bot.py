@@ -102,7 +102,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.info(f"Temporary file removed: {file_name}")
     if os.path.exists(output_file):
         os.remove(output_file)
-        logger.info(f"Output file removed: {output_file}")
+        logger.info(f"Output file removed: { استرات
+
+{output_file}")
 
 def process_file(input_file: str, extension: str) -> str:
     output_file = f"output_{uuid.uuid4()}{extension}"
@@ -201,9 +203,8 @@ def process_file(input_file: str, extension: str) -> str:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Received text message")
     await update.message.reply_text(
-        "אני מקבל רק קבצי PDF או EPUB. שלח לי קובץ, ואוסיף לו עמודwić
-
-ראשון! 😊 אם אתה צריך עזרה, כתוב /start."
+        "אני מקבל רק קבצי PDF או EPUB. שלח לי קובץ, ואוסיף לו עמוד ראשון! 😊 "
+        "אם אתה צריך עזרה, כתוב /start."
     )
 
 # הגדרת Webhook עבור Flask
@@ -215,9 +216,7 @@ async def webhook():
         update = Update.de_json(data, application.bot)
         if update:
             await application.process_update(update)
-           .“
-
-logger.info("Webhook update processed successfully")
+            logger.info("Webhook update processed successfully")
             return "OK"
         else:
             logger.warning("Webhook received invalid update")
